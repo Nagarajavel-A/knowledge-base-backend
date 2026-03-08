@@ -14,7 +14,7 @@ create table if not exists public.member_invites (
   accepted_at timestamp without time zone null,
   created_at timestamp without time zone not null default now(),
   constraint member_invites_role_check check (role in ('owner', 'member')),
-  constraint member_invites_status_check check (status in ('pending', 'accepted', 'revoked', 'expired'))
+  constraint member_invites_status_check check (status in ('approval_pending', 'pending', 'accepted', 'revoked', 'expired'))
 );
 
 -- If table already exists with fewer columns, add missing ones
@@ -39,10 +39,28 @@ begin
   end if;
 end $$;
 
--- Ensure invite lookups are fast and prevent duplicate pending invites for same email/workspace
-create unique index if not exists member_invites_pending_unique_idx
+do $$
+begin
+  if exists (
+    select 1
+    from pg_constraint
+    where conname = 'member_invites_status_check'
+  ) then
+    alter table public.member_invites
+      drop constraint member_invites_status_check;
+  end if;
+
+  alter table public.member_invites
+    add constraint member_invites_status_check
+    check (status in ('approval_pending', 'pending', 'accepted', 'revoked', 'expired'));
+end $$;
+
+-- Ensure invite lookups are fast and prevent duplicate open invites for same email/workspace
+drop index if exists member_invites_pending_unique_idx;
+
+create unique index if not exists member_invites_open_unique_idx
   on public.member_invites (workspace_id, lower(email))
-  where status = 'pending';
+  where status in ('approval_pending', 'pending');
 
 create index if not exists member_invites_email_status_idx
   on public.member_invites (lower(email), status);

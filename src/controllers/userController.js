@@ -118,7 +118,7 @@ export const syncInvites = async (req,res)=>{
   const { data: invites, error: inviteError } = await supabase
     .from(INVITES_TABLE)
     .select("*")
-    .eq("email", normalizedEmail)
+    .ilike("email", normalizedEmail)
     .eq("status", "pending")
 
   if (inviteError) return res.status(400).json(inviteError)
