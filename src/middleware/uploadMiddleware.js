@@ -5,7 +5,7 @@ const allowedExtensions = new Set([".pdf", ".docx", ".txt", ".md", ".xlsx"])
 const maxFileSize = 10 * 1024 * 1024
 
 const upload = multer({
-  dest: "uploads/",
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: maxFileSize
   },

@@ -1,4 +1,3 @@
-import fs from "fs/promises"
 import path from "path"
 import supabase from "../services/supabaseClient.js"
 
@@ -19,16 +18,12 @@ async function attachUploaderProfiles(documents) {
 
   if (!uploaderIds.length) return docs
 
-  const { data: profiles, error: profileError } = await supabase
+  const { data: profiles } = await supabase
     .from("user_profiles")
     .select("id, email, full_name")
     .in("id", uploaderIds)
 
-  if (profileError) {
-    return docs
-  }
-
-  const profileById = Object.fromEntries((profiles || []).map((profile) => [profile.id, profile]))
+  const profileById = Object.fromEntries((profiles || []).map((p) => [p.id, p]))
 
   return docs.map((doc) => ({
     ...doc,
@@ -43,19 +38,12 @@ export const uploadWorkspaceDocument = async (req, res) => {
   const userId = req.user?.id
   const file = req.file
 
-  if (!workspaceId) {
-    return res.status(400).json({ message: "workspaceId is required" })
-  }
+  if (!workspaceId) return res.status(400).json({ message: "workspaceId is required" })
+  if (!userId) return res.status(401).json({ message: "Unauthorized" })
+  if (!file) return res.status(400).json({ message: "No file uploaded" })
 
-  if (!userId) {
-    return res.status(401).json({ message: "Unauthorized" })
-  }
-
-  if (!file) {
-    return res.status(400).json({ message: "No file uploaded" })
-  }
-
-  const { data: membership, error: membershipError } = await getWorkspaceMembership(workspaceId, userId)
+  const { data: membership, error: membershipError } =
+    await getWorkspaceMembership(workspaceId, userId)
 
   if (membershipError) return res.status(400).json(membershipError)
 
@@ -63,8 +51,29 @@ export const uploadWorkspaceDocument = async (req, res) => {
     return res.status(403).json({ message: "Not part of workspace" })
   }
 
-  const normalizedStoragePath = file.path.replace(/\\/g, "/")
   const initialStatus = membership.role === "owner" ? "approved" : "pending"
+
+  const extension = path.extname(file.originalname)
+  const filePath = `${workspaceId}/${Date.now()}_${file.originalname}`
+
+  // Upload to Supabase Storage
+  const { error: uploadError } = await supabase.storage
+    .from("documents")
+    .upload(filePath, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false
+    })
+
+  if (uploadError) {
+    return res.status(400).json(uploadError)
+  }
+
+  // Generate public URL
+  const { data: publicUrlData } = supabase.storage
+    .from("documents")
+    .getPublicUrl(filePath)
+
+  const publicUrl = publicUrlData.publicUrl
 
   const { data: document, error: insertError } = await supabase
     .from("documents")
@@ -75,7 +84,8 @@ export const uploadWorkspaceDocument = async (req, res) => {
       file_type: file.mimetype,
       file_size: file.size,
       notes: req.body?.notes || null,
-      storage_path: normalizedStoragePath,
+      storage_path: filePath,
+      file_url: publicUrl,
       status: initialStatus
     })
     .select("*")
@@ -98,15 +108,11 @@ export const getWorkspaceDocuments = async (req, res) => {
   const { workspaceId } = req.params
   const userId = req.user?.id
 
-  if (!workspaceId) {
-    return res.status(400).json({ message: "workspaceId is required" })
-  }
+  if (!workspaceId) return res.status(400).json({ message: "workspaceId is required" })
+  if (!userId) return res.status(401).json({ message: "Unauthorized" })
 
-  if (!userId) {
-    return res.status(401).json({ message: "Unauthorized" })
-  }
-
-  const { data: membership, error: membershipError } = await getWorkspaceMembership(workspaceId, userId)
+  const { data: membership, error: membershipError } =
+    await getWorkspaceMembership(workspaceId, userId)
 
   if (membershipError) return res.status(400).json(membershipError)
 
@@ -122,13 +128,11 @@ export const getWorkspaceDocuments = async (req, res) => {
 
   if (membership.role === "member") {
     query = query.eq("uploaded_by", userId)
-  } else if (membership.role !== "owner") {
-    return res.status(403).json({ message: "Invalid workspace role" })
   }
 
-  const { data: documents, error: documentsError } = await query
+  const { data: documents, error } = await query
 
-  if (documentsError) return res.status(400).json(documentsError)
+  if (error) return res.status(400).json(error)
 
   const enriched = await attachUploaderProfiles(documents)
 
@@ -138,9 +142,45 @@ export const getWorkspaceDocuments = async (req, res) => {
   })
 }
 
-export const listDocuments = async (req, res) => {
-  req.params.workspaceId = req.params.workspaceId || req.query.workspaceId
-  return getWorkspaceDocuments(req, res)
+export const deleteDocument = async (req, res) => {
+
+  const documentId = req.params.documentId || req.params.id
+  const userId = req.user?.id
+
+  if (!documentId) return res.status(400).json({ message: "documentId is required" })
+  if (!userId) return res.status(401).json({ message: "Unauthorized" })
+
+  const { data: document, error } = await supabase
+    .from("documents")
+    .select("id, workspace_id, uploaded_by, storage_path")
+    .eq("id", documentId)
+    .maybeSingle()
+
+  if (error) return res.status(400).json(error)
+  if (!document) return res.status(404).json({ message: "Document not found" })
+
+  const { data: membership } =
+    await getWorkspaceMembership(document.workspace_id, userId)
+
+  const canDelete = membership?.role === "owner" || document.uploaded_by === userId
+
+  if (!canDelete) {
+    return res.status(403).json({ message: "You do not have permission to delete this document" })
+  }
+
+  // Remove from storage
+  if (document.storage_path) {
+    await supabase.storage
+      .from("documents")
+      .remove([document.storage_path])
+  }
+
+  await supabase
+    .from("documents")
+    .delete()
+    .eq("id", documentId)
+
+  res.json({ success: true })
 }
 
 export const getPendingWorkspaceDocuments = async (req, res) => {
@@ -156,86 +196,31 @@ export const getPendingWorkspaceDocuments = async (req, res) => {
     return res.status(401).json({ message: "Unauthorized" })
   }
 
-  const { data: membership, error: membershipError } = await getWorkspaceMembership(workspaceId, userId)
+  const { data: membership, error: membershipError } =
+    await getWorkspaceMembership(workspaceId, userId)
 
   if (membershipError) return res.status(400).json(membershipError)
 
   if (!membership || membership.role !== "owner") {
-    return res.status(403).json({ message: "Only workspace owner can access pending documents" })
+    return res.status(403).json({
+      message: "Only workspace owner can access pending documents"
+    })
   }
 
-  const { data: documents, error: documentsError } = await supabase
+  const { data: documents, error } = await supabase
     .from("documents")
     .select("*")
     .eq("workspace_id", workspaceId)
     .eq("status", "pending")
     .order("created_at", { ascending: false })
 
-  if (documentsError) return res.status(400).json(documentsError)
+  if (error) return res.status(400).json(error)
 
   const enriched = await attachUploaderProfiles(documents)
 
   res.json({
     documents: enriched
   })
-}
-
-export const deleteDocument = async (req, res) => {
-
-  const documentId = req.params.documentId || req.params.id
-  const userId = req.user?.id
-
-  if (!documentId) {
-    return res.status(400).json({ message: "documentId is required" })
-  }
-
-  if (!userId) {
-    return res.status(401).json({ message: "Unauthorized" })
-  }
-
-  const { data: document, error: documentError } = await supabase
-    .from("documents")
-    .select("id, workspace_id, uploaded_by, storage_path")
-    .eq("id", documentId)
-    .maybeSingle()
-
-  if (documentError) return res.status(400).json(documentError)
-
-  if (!document) {
-    return res.status(404).json({ message: "Document not found" })
-  }
-
-  const { data: membership, error: membershipError } = await getWorkspaceMembership(document.workspace_id, userId)
-
-  if (membershipError) return res.status(400).json(membershipError)
-
-  if (!membership) {
-    return res.status(403).json({ message: "Not part of workspace" })
-  }
-
-  const canDelete = membership.role === "owner" || document.uploaded_by === userId
-
-  if (!canDelete) {
-    return res.status(403).json({ message: "You do not have permission to delete this document" })
-  }
-
-  const { error: deleteError } = await supabase
-    .from("documents")
-    .delete()
-    .eq("id", documentId)
-
-  if (deleteError) return res.status(400).json(deleteError)
-
-  if (document.storage_path) {
-    const normalizedPath = document.storage_path.replace(/\\/g, "/")
-    const absolutePath = path.isAbsolute(normalizedPath)
-      ? normalizedPath
-      : path.join(process.cwd(), normalizedPath)
-
-    await fs.unlink(absolutePath).catch(() => {})
-  }
-
-  res.json({ success: true })
 }
 
 export const updateDocumentApproval = async (req, res) => {
@@ -253,12 +238,14 @@ export const updateDocumentApproval = async (req, res) => {
   }
 
   if (status !== "approved" && status !== "rejected") {
-    return res.status(400).json({ message: "status must be either 'approved' or 'rejected'" })
+    return res.status(400).json({
+      message: "status must be either 'approved' or 'rejected'"
+    })
   }
 
   const { data: document, error: documentError } = await supabase
     .from("documents")
-    .select("id, workspace_id")
+    .select("id, workspace_id, storage_path")
     .eq("id", documentId)
     .maybeSingle()
 
@@ -268,12 +255,13 @@ export const updateDocumentApproval = async (req, res) => {
     return res.status(404).json({ message: "Document not found" })
   }
 
-  const { data: membership, error: membershipError } = await getWorkspaceMembership(document.workspace_id, userId)
-
-  if (membershipError) return res.status(400).json(membershipError)
+  const { data: membership } =
+    await getWorkspaceMembership(document.workspace_id, userId)
 
   if (!membership || membership.role !== "owner") {
-    return res.status(403).json({ message: "Only workspace owner can approve or reject documents" })
+    return res.status(403).json({
+      message: "Only workspace owner can approve or reject documents"
+    })
   }
 
   const { data: updatedDocument, error: updateError } = await supabase
@@ -300,4 +288,9 @@ export const rejectDocument = async (req, res) => {
   req.params.documentId = req.params.documentId || req.params.id
   req.body = { ...(req.body || {}), status: "rejected" }
   return updateDocumentApproval(req, res)
+}
+
+export const listDocuments = async (req, res) => {
+  req.params.workspaceId = req.params.workspaceId || req.query.workspaceId
+  return getWorkspaceDocuments(req, res)
 }
