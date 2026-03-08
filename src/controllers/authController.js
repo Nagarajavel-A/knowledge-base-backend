@@ -1,0 +1,29 @@
+import supabase from "../services/supabaseClient.js"
+
+
+
+export const loginWithGoogle = async (req, res) => {
+
+    console.log("Google route triggered")
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: "google",
+  })
+
+  if (error) return res.status(400).json(error)
+
+    console.log("OAuth URL:", data.url)
+
+  return res.redirect(302, data.url)
+}
+
+
+export const loginWithMicrosoft = async (req, res) => {
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: "azure",
+  })
+
+  if (error) return res.status(400).json(error)
+
+  res.json(data)
+}
