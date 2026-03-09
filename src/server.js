@@ -9,6 +9,7 @@ import userRoutes from "./routes/userRoutes.js"
 import workspaceRoutes from "./routes/workspaceRoutes.js"
 import memberRoutes from "./routes/memberRoutes.js"
 import documentRoutes from "./routes/documentRoutes.js"
+import ragRoutes from "./routes/ragRoutes.js"
 
 const app = express()
 
@@ -25,6 +26,7 @@ app.use("/users", userRoutes)
 app.use("/workspaces", workspaceRoutes)
 app.use("/workspaces", memberRoutes)
 app.use("/documents", documentRoutes)
+app.use("/rag", ragRoutes)
 
 app.get("/", (req, res) => {
   res.send("Backend working")

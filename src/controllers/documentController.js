@@ -1,5 +1,24 @@
 import path from "path"
 import supabase from "../services/supabaseClient.js"
+import axios from "axios"
+
+const DOCUMENTS_BUCKET = process.env.SUPABASE_DOCUMENTS_BUCKET || "documents"
+const RAG_SERVICE_URL = process.env.RAG_SERVICE_URL || "http://localhost:8000"
+
+function sanitizeFileName(fileName) {
+  const baseName = path.basename(fileName || "document")
+  return baseName.replace(/[^a-zA-Z0-9._-]/g, "_")
+}
+
+function getStoragePublicUrl(storagePath) {
+  if (!storagePath) return null
+
+  const { data } = supabase.storage
+    .from(DOCUMENTS_BUCKET)
+    .getPublicUrl(storagePath)
+
+  return data?.publicUrl || null
+}
 
 async function getWorkspaceMembership(workspaceId, userId) {
   const { data, error } = await supabase
@@ -27,6 +46,7 @@ async function attachUploaderProfiles(documents) {
 
   return docs.map((doc) => ({
     ...doc,
+    file_url: doc.file_url || getStoragePublicUrl(doc.storage_path),
     uploader_email: profileById[doc.uploaded_by]?.email || null,
     uploader_name: profileById[doc.uploaded_by]?.full_name || null
   }))
@@ -53,12 +73,12 @@ export const uploadWorkspaceDocument = async (req, res) => {
 
   const initialStatus = membership.role === "owner" ? "approved" : "pending"
 
-  const extension = path.extname(file.originalname)
-  const filePath = `${workspaceId}/${Date.now()}_${file.originalname}`
+  const safeFileName = sanitizeFileName(file.originalname)
+  const filePath = `${workspaceId}/${Date.now()}_${safeFileName}`
 
   // Upload to Supabase Storage
   const { error: uploadError } = await supabase.storage
-    .from("documents")
+    .from(DOCUMENTS_BUCKET)
     .upload(filePath, file.buffer, {
       contentType: file.mimetype,
       upsert: false
@@ -68,12 +88,7 @@ export const uploadWorkspaceDocument = async (req, res) => {
     return res.status(400).json(uploadError)
   }
 
-  // Generate public URL
-  const { data: publicUrlData } = supabase.storage
-    .from("documents")
-    .getPublicUrl(filePath)
-
-  const publicUrl = publicUrlData.publicUrl
+  const fileUrl = getStoragePublicUrl(filePath)
 
   const { data: document, error: insertError } = await supabase
     .from("documents")
@@ -85,13 +100,33 @@ export const uploadWorkspaceDocument = async (req, res) => {
       file_size: file.size,
       notes: req.body?.notes || null,
       storage_path: filePath,
-      file_url: publicUrl,
+      file_url: fileUrl,
       status: initialStatus
     })
     .select("*")
     .single()
 
-  if (insertError) return res.status(400).json(insertError)
+  if (insertError) {
+    await supabase.storage
+      .from(DOCUMENTS_BUCKET)
+      .remove([filePath])
+      .catch(() => {})
+
+    return res.status(400).json(insertError)
+  }
+
+  // Trigger RAG ingestion if approved
+  if (document.status === "approved") {
+    try {
+      await axios.post(`${RAG_SERVICE_URL}/ingest`, {
+        workspace_id: workspaceId,
+        document_id: document.id,
+        file_url: fileUrl
+      })
+    } catch (err) {
+      console.error("RAG ingestion failed:", err?.response?.data || err.message)
+    }
+  }
 
   res.status(201).json({
     document
@@ -159,8 +194,14 @@ export const deleteDocument = async (req, res) => {
   if (error) return res.status(400).json(error)
   if (!document) return res.status(404).json({ message: "Document not found" })
 
-  const { data: membership } =
+  const { data: membership, error: membershipError } =
     await getWorkspaceMembership(document.workspace_id, userId)
+
+  if (membershipError) return res.status(400).json(membershipError)
+
+  if (!membership) {
+    return res.status(403).json({ message: "Not part of workspace" })
+  }
 
   const canDelete = membership?.role === "owner" || document.uploaded_by === userId
 
@@ -170,15 +211,22 @@ export const deleteDocument = async (req, res) => {
 
   // Remove from storage
   if (document.storage_path) {
-    await supabase.storage
-      .from("documents")
+    const { error: storageDeleteError } = await supabase.storage
+      .from(DOCUMENTS_BUCKET)
       .remove([document.storage_path])
+
+    if (storageDeleteError) {
+      // Keep DB cleanup resilient even if storage object is already missing.
+      console.warn("[documents] Failed to remove object from storage:", storageDeleteError.message || storageDeleteError)
+    }
   }
 
-  await supabase
+  const { error: deleteError } = await supabase
     .from("documents")
     .delete()
     .eq("id", documentId)
+
+  if (deleteError) return res.status(400).json(deleteError)
 
   res.json({ success: true })
 }
